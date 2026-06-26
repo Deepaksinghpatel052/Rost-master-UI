@@ -76,6 +76,9 @@ export default function RoastMasterAssistant() {
   // or the browser firing a result event more than once for the same utterance)
   const resultHandledRef = useRef(false);
   const transcriptEndRef = useRef(null);
+  // Tracks how many times we've auto-retried after a transient "network" error,
+  // so we retry once and then give up instead of looping forever
+  const networkRetryCountRef = useRef(0);
 
   // Check browser support once
   const speechSupported =
@@ -138,9 +141,10 @@ export default function RoastMasterAssistant() {
         ]);
         speak(data.reply);
       } catch (err) {
-        setErrorText(err.message || "Something went wrong. Please try again.");
+        const reason = err.message || "Something went wrong while getting a response.";
+        setErrorText(`${reason} Tap the mic and try again.`);
         setAssistantState("error");
-        setTimeout(() => setAssistantState("idle"), 2200);
+        // No auto-clear — stays visible until the user retries.
       }
     },
     [speak]
@@ -156,27 +160,87 @@ export default function RoastMasterAssistant() {
     recognition.lang = "en-IN";
     recognition.interimResults = false;
     recognition.maxAlternatives = 1;
+    // continuous=false is default, but being explicit: a single utterance per session
+    recognition.continuous = false;
 
     resultHandledRef.current = false;
+
+    recognition.onstart = () => {
+      console.log("[speech] recognition started, mic is now listening");
+    };
+
+    recognition.onaudiostart = () => {
+      console.log("[speech] audio capture started — mic stream is open");
+    };
+
+    recognition.onspeechstart = () => {
+      console.log("[speech] speech detected");
+    };
 
     recognition.onresult = (event) => {
       // Only handle the first result event for this session — prevents the
       // same transcript being sent twice if the browser fires onresult again.
       if (resultHandledRef.current) return;
       resultHandledRef.current = true;
+      networkRetryCountRef.current = 0; // success — reset the retry counter
 
       const transcript = event.results[0][0].transcript;
+      const confidence = event.results[0][0].confidence;
+      console.log("[speech] result:", transcript, "| confidence:", confidence);
+
+      if (!transcript || !transcript.trim()) {
+        setErrorText("Heard something, but couldn't make out any words. Try again.");
+        setAssistantState("idle");
+        return;
+      }
       sendToBackend(transcript);
     };
 
-    recognition.onerror = () => {
-      setErrorText("Couldn't hear you clearly. Try again.");
-      setAssistantState("idle");
+    recognition.onerror = (event) => {
+      // event.error tells us exactly why it failed instead of guessing.
+      // Common values: "no-speech", "audio-capture", "not-allowed", "network", "aborted"
+      console.error("[speech] error:", event.error);
+
+      // "network" errors from the Web Speech API are often transient (a brief
+      // hiccup talking to the browser's speech recognition service), so retry
+      // once automatically before bothering the user with an error message.
+      if (event.error === "network" && networkRetryCountRef.current < 1) {
+        networkRetryCountRef.current += 1;
+        console.log("[speech] network error — retrying once automatically");
+        isListeningRef.current = false;
+        setTimeout(() => startListening(), 400);
+        return;
+      }
+      networkRetryCountRef.current = 0;
+
+      const errorMessages = {
+        "no-speech": "Didn't catch any speech. Tap the mic and try again.",
+        "audio-capture": "No microphone found. Check your mic connection, then try again.",
+        "not-allowed": "Microphone permission was denied. Allow mic access in your browser settings, then try again.",
+        "network": "Couldn't reach the speech service. Check your connection and tap the mic to try again.",
+        "aborted": null, // user-initiated stop, not a real error — don't show a message
+      };
+
+      const message = errorMessages[event.error] ?? `Speech recognition error: ${event.error}. Tap the mic to try again.`;
+      if (message) {
+        setErrorText(message);
+        setAssistantState("error");
+        // No auto-clear here — the error stays visible until the user taps
+        // the mic again, so they don't miss why it failed.
+      } else {
+        setAssistantState("idle");
+      }
       isListeningRef.current = false;
     };
 
     recognition.onend = () => {
+      console.log(
+        "[speech] recognition ended | result captured:",
+        resultHandledRef.current
+      );
       isListeningRef.current = false;
+      // Only fall back to idle if we're still showing "listening" and got nothing —
+      // if a result already triggered "thinking"/"speaking", don't override that.
       setAssistantState((current) => (current === "listening" ? "idle" : current));
     };
 
@@ -253,22 +317,18 @@ export default function RoastMasterAssistant() {
       <div style={styles.leftPanel}>
         <div style={styles.topBar}>
           <span style={styles.title}>Roast master</span>
-          {/* <button
-            onClick={handleToggleCloud}
-            disabled={!statusLoaded}
-            style={{
-              ...styles.toggleBtn,
-              borderColor: cloudEnabled ? "#F2A65A" : "#1B8FA8",
-              color: cloudEnabled ? "#F2A65A" : "#3ED6E8",
-            }}
-          >
-            {cloudEnabled ? "Cloud (Claude)" : "Local (Ollama)"}
-          </button> */}
         </div>
 
         <GeminiBlob state={assistantState} />
 
-        <p style={styles.statusText}>{statusLabelMap[assistantState]}</p>
+        <p
+          style={{
+            ...styles.statusText,
+            color: assistantState === "error" ? "#E24B4A" : styles.statusText.color,
+          }}
+        >
+          {statusLabelMap[assistantState]}
+        </p>
 
         <button
           onClick={handleMicClick}
